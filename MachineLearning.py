@@ -80,6 +80,7 @@ def train_model(good_folder, bad_folder, save_folder, log_callback,
             log_callback("Error: Manual batch size and epochs must be integers.")
             return None
 
+    log_callback(f"Training device: {device}")
     log_callback(f"Total images: {total_images} (Train: {train_size}, Val: {val_size}), Batch size: {batch_size}")
     
     global model
@@ -391,15 +392,24 @@ help_text = (
     "- Allowed image formats - jpg, jpeg, png, bmp.\n"
     "- Optionally, select a folder where the trained model will be saved.\n"
     "- By default, the application auto-adjusts training parameters:\n"
-    "    • Batch Size = min(32, max(4, train_size//10))\n"
-    "    • Epochs = max(10, min(50, total_images//10))\n\n"
     "If you disable auto-adjust, you can manually enter the Batch Size and Epochs.\n\n"
     "Predict TAB:\n"
     "- Load a model (.pth file) and then select a test image.\n"
     "- The model's prediction and confidence will be displayed.\n\n"
+    "Training Terminology:\n"
+    "Example - ..Epoch 1/42: Loss 0.7709..\n"
+    "- Epoch 1/42 means that the model has just finished its first full pass through the training data, and it is set to run for a total of 42 passes (epochs).\n"
+    "The Loss 0.7709 indicates how far off the model's predictions are from the actual values after this first pass.\n"
+    "A lower loss value generally means the model is doing a better job, and ideally, you would see this number decrease over the subsequent epochs.\n\n"
+    "Example - ..Validation Accuracy: 83.53%..\n"
+    "- This indicates how well the model is performing on unseen data (validation set) after training.\n"
+    "It correctly classified about 83.53% of them. This metric helps assess how well the model might perform on new, unseen data.\n\n"
+    "Info:\n"
     "This application uses transfer learning with a pre-trained ResNet18.\n"
     "Training runs in a separate thread so that the GUI remains responsive.\n"
     "A progress bar displays training progression."
+
+    
 )
 
 help_label = ctk.CTkLabel(help_frame_inner, text=help_text, justify="left", wraplength=850, font=modern_font)
