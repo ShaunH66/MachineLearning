@@ -418,4 +418,9 @@ help_label.pack(padx=10, pady=10, anchor="nw")
 # ---------------------------
 # Run the Application
 # ---------------------------
+
+log_callback("Welcome to the AI Image Training & Prediction Application!")
+log_callback("Select Good & Bad image Folders")
+log_callback("Select Trained Model Saved Output Location")
+log_callback("Awaiting User Input...")
 app.mainloop()
