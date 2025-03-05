@@ -175,9 +175,6 @@ def select_roi_for_image(img):
     roi_win.wait_window()  # block until window is closed
     return result[0]
 
-# ---------------------------
-# Modify the Training Function to optionally accept a pre-built dataset
-# ---------------------------
 def train_model(good_folder, bad_folder, save_folder, log_callback,
                 auto_adjust=True, manual_batch_size=None, manual_epochs=None,
                 progress_callback=None, manual_dataset=None):
