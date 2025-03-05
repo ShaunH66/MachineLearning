@@ -2,8 +2,9 @@ import os
 import time
 import threading
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog
-from PIL import Image
+from PIL import Image, ImageGrab, ImageTk
 import cv2
 import numpy as np
 import torch
@@ -11,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision import transforms
-from torchvision.models import resnet18, ResNet18_Weights
+from torchvision.models import resnet18, resnet50, ResNet18_Weights, ResNet50_Weights
 
 # ---------------------------
 # Global Setup and Transforms
@@ -100,19 +101,95 @@ def overlay_gradcam_boxes(frame, heatmap, threshold=0.5):
         cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 2)
     return frame
 
+
+from PIL import ImageTk
+
 # ---------------------------
-# Training Function with Progress Callback
+# New Dataset for Manual ROI Images
+# ---------------------------
+class ManualROIDataset(Dataset):
+    def __init__(self, data_list, transform=None):
+        """
+        data_list: list of tuples (PIL image, label)
+        """
+        self.data_list = data_list
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.data_list)
+    
+    def __getitem__(self, idx):
+        img, label = self.data_list[idx]
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+def select_roi_for_image(img):
+    # Get maximum allowed dimensions (80% of screen width and height)
+    max_width = app.winfo_screenwidth() * 0.8
+    max_height = app.winfo_screenheight() * 0.8
+    orig_width, orig_height = img.size
+    scale = min(1.0, max_width / orig_width, max_height / orig_height)
+    if scale < 1.0:
+        new_size = (int(orig_width * scale), int(orig_height * scale))
+        img_resized = img.resize(new_size, Image.Resampling.LANCZOS)
+    else:
+        img_resized = img
+
+    # Create a blocking Toplevel window for ROI selection using the resized image
+    roi_win = tk.Toplevel(app)
+    roi_win.title("Select ROI")
+    tk_img = ImageTk.PhotoImage(img_resized)
+    canvas = tk.Canvas(roi_win, width=img_resized.width, height=img_resized.height, cursor="cross")
+    canvas.pack()
+    canvas.create_image(0, 0, anchor="nw", image=tk_img)
+
+    start_x, start_y = None, None
+    rect = None
+    result = [None]  # mutable container
+
+    def on_button_press(event):
+        nonlocal start_x, start_y, rect
+        start_x, start_y = event.x, event.y
+        rect = canvas.create_rectangle(start_x, start_y, start_x, start_y, outline="red", width=2)
+
+    def on_move(event):
+        canvas.coords(rect, start_x, start_y, event.x, event.y)
+
+    def on_button_release(event):
+        nonlocal result
+        end_x, end_y = event.x, event.y
+        roi_win.destroy()
+        bbox = (min(start_x, end_x), min(start_y, end_y), max(start_x, end_x), max(start_y, end_y))
+        # Map the coordinates back to the original image size if scaling was applied.
+        if scale < 1.0:
+            inv_scale = 1.0 / scale
+            bbox = (int(bbox[0] * inv_scale), int(bbox[1] * inv_scale),
+                    int(bbox[2] * inv_scale), int(bbox[3] * inv_scale))
+        cropped = img.crop(bbox)
+        result[0] = cropped
+
+    canvas.bind("<ButtonPress-1>", on_button_press)
+    canvas.bind("<B1-Motion>", on_move)
+    canvas.bind("<ButtonRelease-1>", on_button_release)
+    roi_win.wait_window()  # block until window is closed
+    return result[0]
+
+# ---------------------------
+# Modify the Training Function to optionally accept a pre-built dataset
 # ---------------------------
 def train_model(good_folder, bad_folder, save_folder, log_callback,
                 auto_adjust=True, manual_batch_size=None, manual_epochs=None,
-                progress_callback=None):
-    good_paths = load_image_paths(good_folder)
-    bad_paths = load_image_paths(bad_folder)
-    if len(good_paths) == 0 or len(bad_paths) == 0:
-        log_callback("Error: One of the folders has no images.")
-        return None
-
-    dataset = CustomImageDataset(good_paths, bad_paths, transform=transform)
+                progress_callback=None, manual_dataset=None):
+    if manual_dataset is not None:
+        dataset = manual_dataset
+    else:
+        good_paths = load_image_paths(good_folder)
+        bad_paths = load_image_paths(bad_folder)
+        if len(good_paths) == 0 or len(bad_paths) == 0:
+            log_callback("Error: One of the folders has no images.")
+            return None
+        dataset = CustomImageDataset(good_paths, bad_paths, transform=transform)
     total_images = len(dataset)
     train_size = int(0.8 * total_images)
     val_size = total_images - train_size
@@ -132,7 +209,9 @@ def train_model(good_folder, bad_folder, save_folder, log_callback,
         except Exception as e:
             log_callback("Error: Manual batch size and epochs must be integers.")
             return None
-
+    
+    start_time = time.time()
+    log_callback(f"Training started at: {time.ctime(start_time)}")
     log_callback(f"Training device: {device}")
     log_callback(f"Total images: {total_images} (Train: {train_size}, Val: {val_size}), Batch size: {batch_size}")
     
@@ -148,6 +227,9 @@ def train_model(good_folder, bad_folder, save_folder, log_callback,
     
     log_callback(f"Training for {epochs} epochs...")
     for epoch in range(epochs):
+        if cancel_training.is_set():
+            log_callback("Training cancelled.")
+            return
         model.train()
         running_loss = 0.0
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
@@ -185,6 +267,9 @@ def train_model(good_folder, bad_folder, save_folder, log_callback,
     save_path = os.path.join(save_folder, "user_trained_model.pth")
     torch.save(model.state_dict(), save_path)
     log_callback(f"Model saved to {save_path}")
+    end_time = time.time()
+    elapsed = end_time - start_time
+    log_callback(f"Training completed in {elapsed:.2f} seconds")
     return model
 
 # ---------------------------
@@ -206,6 +291,7 @@ def predict_image(image_path, model):
         predicted_class = class_names[pred.item()]
     return predicted_class, confidence, img
 
+
 # ---------------------------
 # GUI Using CustomTkinter with Threading and Progress Bar
 # ---------------------------
@@ -213,8 +299,8 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 app = ctk.CTk()
-app.title("AI Image Training & Prediction Application - By Shaun Harris")
-app.geometry("950x850")
+app.title("AI Image Training & Prediction Application - v2 Beta - By Shaun Harris")
+app.geometry("950x910")
 
 # Create TabView
 tabview = ctk.CTkTabview(app, width=900, height=800)
@@ -276,20 +362,24 @@ def select_save_folder():
 button_frame = ctk.CTkFrame(train_frame)
 button_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nw")
 
+roi_toggle_var = ctk.BooleanVar(value=False)
+roi_toggle_cb = ctk.CTkCheckBox(button_frame, text="Manual ROI (Region of Interest) Selection - annotate each image with a bounding box", variable=roi_toggle_var, font=modern_font)
+roi_toggle_cb.grid(row=0, column=0, padx=10, pady=10, sticky="nw")
+
 good_folder_btn = ctk.CTkButton(button_frame, text="Select Good Images Folder", command=select_good_folder, font=modern_font, width=200)
-good_folder_btn.grid(row=0, column=0, padx=5, pady=5, sticky="w")
+good_folder_btn.grid(row=1, column=0, padx=5, pady=5, sticky="w")
 good_folder_label = ctk.CTkLabel(button_frame, textvariable=good_folder_var, font=modern_font, wraplength=300)
-good_folder_label.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+good_folder_label.grid(row=1, column=1, padx=5, pady=5, sticky="w")
 
 bad_folder_btn = ctk.CTkButton(button_frame, text="Select Bad Images Folder", command=select_bad_folder, font=modern_font, width=200)
-bad_folder_btn.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+bad_folder_btn.grid(row=2, column=0, padx=5, pady=5, sticky="w")
 bad_folder_label = ctk.CTkLabel(button_frame, textvariable=bad_folder_var, font=modern_font, wraplength=300)
-bad_folder_label.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+bad_folder_label.grid(row=2, column=1, padx=5, pady=5, sticky="w")
 
 save_folder_btn = ctk.CTkButton(button_frame, text="Select Trained Model Save Location", command=select_save_folder, font=modern_font, width=200)
-save_folder_btn.grid(row=2, column=0, padx=5, pady=5, sticky="w")
+save_folder_btn.grid(row=3, column=0, padx=5, pady=5, sticky="w")
 save_folder_label = ctk.CTkLabel(button_frame, textvariable=save_folder_var, font=modern_font, wraplength=300)
-save_folder_label.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+save_folder_label.grid(row=3, column=1, padx=5, pady=5, sticky="w")
 
 params_frame = ctk.CTkFrame(train_frame)
 params_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nw")
@@ -329,16 +419,42 @@ progress_bar = ctk.CTkProgressBar(train_frame, width=800)
 progress_bar.grid(row=4, column=0, padx=10, pady=10, sticky="w")
 progress_bar.set(0)
 
+# Global cancel event for training
+cancel_training = threading.Event()
+
 def update_progress(value):
     percent = int(value * 100)
     app.after(0, lambda: progress_bar.set(value))
     app.after(0, lambda: progress_text_var.set(f"{percent}% Completed"))
 
 def start_training():
+    cancel_training.clear()  # reset cancel event
+    update_progress(0)
     good_folder = good_folder_var.get()
     bad_folder = bad_folder_var.get()
     save_folder = save_folder_var.get()
-    if not good_folder or not bad_folder:
+    # If manual ROI selection is enabled, we require only the folder paths,
+    # then we will process each image manually.
+    if roi_toggle_var.get():
+        log_callback("Manual ROI Selection enabled. Annotating images...")
+        data_list = []
+        # Process Good images (label 0)
+        good_files = load_image_paths(good_folder)
+        for file in good_files:
+            img = Image.open(file).convert("RGB")
+            cropped = select_roi_for_image(img)
+            data_list.append((cropped, 0))
+        # Process Bad images (label 1)
+        bad_files = load_image_paths(bad_folder)
+        for file in bad_files:
+            img = Image.open(file).convert("RGB")
+            cropped = select_roi_for_image(img)
+            data_list.append((cropped, 1))
+        manual_dataset = ManualROIDataset(data_list, transform=transform)
+    else:
+        manual_dataset = None
+
+    if not good_folder or (not bad_folder and not roi_toggle_var.get()):
         log_callback("Please select both Good and Bad image folders.")
         return
     log_text.delete("1.0", "end")
@@ -348,12 +464,32 @@ def start_training():
     manual_ep = manual_epochs_var.get() if not auto_adjust else None
     train_thread = threading.Thread(
         target=train_model,
-        args=(good_folder, bad_folder, save_folder, log_callback, auto_adjust, manual_bs, manual_ep, update_progress)
+        args=(good_folder, bad_folder, save_folder, log_callback, auto_adjust, manual_bs, manual_ep, update_progress, manual_dataset)
     )
     train_thread.start()
 
+# Model Architecture Dropdown & Description
+model_arch_var = ctk.StringVar(value="ResNet18")
+model_arch_options = ["ResNet18", "ResNet50"]
+model_arch_dropdown = ctk.CTkOptionMenu(train_frame, variable=model_arch_var, values=model_arch_options, font=modern_font)
+model_arch_dropdown.grid(row=5, column=0, padx=10, pady=10, sticky="nw")
+
+model_arch_descriptions = {
+    "ResNet18": "ResNet18: A relatively lightweight neural network with residual connections. Good for general-purpose classification. Use for simple object datasets.",
+    "ResNet50": "ResNet50: A deeper model offering higher accuracy on complex tasks but with higher computational cost. Use for more complex datasets. More weighs, 50 in this case, doesn't always mean better performance."
+}
+def update_model_arch_desc(*args):
+    desc = model_arch_descriptions.get(model_arch_var.get(), "")
+    model_arch_desc_label.configure(text=desc)
+model_arch_var.trace("w", update_model_arch_desc)
+model_arch_desc_label = ctk.CTkLabel(train_frame, text=model_arch_descriptions[model_arch_var.get()], font=modern_font, wraplength=300)
+model_arch_desc_label.grid(row=6, column=0, padx=10, pady=10, sticky="nw")
+
 train_btn = ctk.CTkButton(train_frame, text="Train Model", command=start_training, font=modern_font, width=150)
-train_btn.grid(row=5, column=0, padx=10, pady=10, sticky="w")
+train_btn.grid(row=7, column=0, padx=10, pady=10, sticky="w")
+
+cancel_btn = ctk.CTkButton(train_frame, text="Cancel Training", command=lambda: cancel_training.set(), font=modern_font, width=150)
+cancel_btn.grid(row=8, column=0, padx=10, pady=10, sticky="w")
 
 ##########################
 # PREDICT TAB WIDGETS
@@ -372,7 +508,6 @@ model_select_label.pack(anchor="nw", padx=5, pady=5)
 model_select_frame = ctk.CTkFrame(model_select_container)
 model_select_frame.pack(padx=5, pady=5, fill="both", expand=True)
 
-# Existing model selection widgets
 model_path_var = ctk.StringVar()
 
 def select_model_file():
@@ -398,7 +533,6 @@ select_model_btn.grid(row=0, column=0, padx=5, pady=5, sticky="w")
 model_file_label = ctk.CTkLabel(model_select_frame, textvariable=model_path_var, font=modern_font, wraplength=300)
 model_file_label.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
-
 # ------------------------------------------------
 # 2) Image Prediction Container
 # ------------------------------------------------
@@ -422,7 +556,6 @@ def select_predict_image():
             predict_result_label.configure(text="Error loading image.")
             return
         
-        # If "bad", apply Grad-CAM bounding boxes
         display_img = img.resize((250, 250))
         if predicted_class == "bad":
             frame_np = np.array(display_img)
@@ -438,7 +571,6 @@ def select_predict_image():
         ctk_img = CTkImage(light_image=display_img, size=(250, 250))
         predict_image_label.configure(image=ctk_img, text="", font=modern_font)
         predict_image_label.image = ctk_img
-        # Move "Prediction" & "Confidence" text into the same frame
         predict_result_label.configure(text=f"Prediction: {predicted_class}\nConfidence: {confidence:.2f}%", font=modern_font)
 
 select_predict_img_btn = ctk.CTkButton(predict_image_frame, text="Select Image For Prediction", command=select_predict_image, font=modern_font, width=200)
@@ -450,14 +582,13 @@ predict_image_label.grid(row=1, column=0, padx=5, pady=5, sticky="w")
 predict_result_label = ctk.CTkLabel(predict_image_frame, text="Prediction will appear here", font=modern_font)
 predict_result_label.grid(row=2, column=0, padx=5, pady=5, sticky="w")
 
-
 # ------------------------------------------------
-# 3) Video Prediction Container
+# 3) Video & Screen Capture Prediction Container
 # ------------------------------------------------
 video_pred_container = ctk.CTkFrame(predict_frame, corner_radius=10)
 video_pred_container.grid(row=2, column=0, padx=10, pady=10, sticky="nw")
 
-video_pred_label = ctk.CTkLabel(video_pred_container, text="Live Feed & Recorded Video", font=modern_font)
+video_pred_label = ctk.CTkLabel(video_pred_container, text="Live Feed, Recorded Video & Screen Snip", font=modern_font)
 video_pred_label.pack(anchor="nw", padx=5, pady=5)
 
 video_pred_frame = ctk.CTkFrame(video_pred_container)
@@ -485,7 +616,9 @@ def live_feed_prediction():
             max_prob, pred = torch.max(probs, 1)
             confidence = max_prob.item() * 100
             predicted_class = "good" if pred.item() == 0 else "bad"
-        cv2.putText(frame, f"{predicted_class}: {confidence:.2f}%", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            color = (0,255,0) if predicted_class=="good" else (0,0,255)
+            cv2.putText(frame, f"{predicted_class}: {confidence:.2f}%", (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
         if predicted_class == "bad":
             cam = generate_gradcam(model, input_tensor, target_layer)
             cam_resized = cv2.resize(cam, (frame.shape[1], frame.shape[0]))
@@ -521,7 +654,9 @@ def recorded_video_prediction():
             max_prob, pred = torch.max(probs, 1)
             confidence = max_prob.item() * 100
             predicted_class = "good" if pred.item() == 0 else "bad"
-        cv2.putText(frame, f"{predicted_class}: {confidence:.2f}%", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            color = (0,255,0) if predicted_class=="good" else (0,0,255)
+            cv2.putText(frame, f"{predicted_class}: {confidence:.2f}%", (10,30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
         if predicted_class == "bad":
             cam = generate_gradcam(model, input_tensor, target_layer)
             cam_resized = cv2.resize(cam, (frame.shape[1], frame.shape[0]))
@@ -532,22 +667,92 @@ def recorded_video_prediction():
     cap.release()
     cv2.destroyAllWindows()
 
+def screen_capture_prediction():
+    if model is None:
+        predict_status_label.configure(text="Error: No model loaded.", font=modern_font)
+        return
+    app.after(0, snip_screen_prediction)
+
+# ---------------------------
+# Screen Snip Prediction Function (with Grad-CAM)
+# ---------------------------
+def snip_screen_prediction():
+    # Create a full-screen transparent Toplevel for snipping
+    top = tk.Toplevel(app)
+    top.attributes("-fullscreen", True)
+    top.attributes("-alpha", 0.3)
+    top.configure(background="black")
+    
+    canvas = tk.Canvas(top, cursor="cross", bg="gray")
+    canvas.pack(fill=tk.BOTH, expand=True)
+    
+    start_x, start_y = None, None
+    rect = None
+
+    def on_button_press(event):
+        nonlocal start_x, start_y, rect
+        start_x, start_y = event.x, event.y
+        rect = canvas.create_rectangle(start_x, start_y, start_x, start_y, outline="red", width=2)
+
+    def on_move_press(event):
+        nonlocal rect
+        curX, curY = (event.x, event.y)
+        canvas.coords(rect, start_x, start_y, curX, curY)
+
+    def on_button_release(event):
+        nonlocal start_x, start_y, rect
+        end_x, end_y = event.x, event.y
+        top.destroy()
+        bbox = (min(start_x, end_x), min(start_y, end_y), max(start_x, end_x), max(start_y, end_y))
+        screen = ImageGrab.grab(bbox=bbox)
+        screen = screen.convert("RGB")
+        input_tensor = transform(screen).unsqueeze(0).to(device)
+        with torch.no_grad():
+            outputs = model(input_tensor)
+            probs = F.softmax(outputs, dim=1)
+            max_prob, pred = torch.max(probs, 1)
+            confidence = max_prob.item() * 100
+            class_names = ["good", "bad"]
+            predicted_class = class_names[pred.item()]
+        screen_np = np.array(screen)
+        screen_np = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
+        if predicted_class == "bad":
+            target_layer = model.layer4[1].conv2
+            cam = generate_gradcam(model, input_tensor, target_layer)
+            cam_resized = cv2.resize(cam, (screen_np.shape[1], screen_np.shape[0]))
+            screen_np = overlay_gradcam_boxes(screen_np, cam_resized, threshold=0.5)
+        color = (0,255,0) if predicted_class == "good" else (0,0,255)
+        cv2.putText(screen_np, f"{predicted_class}: {confidence:.2f}%", (10,30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        cv2.imshow("Screen Snip Prediction (Press 'q' to quit)", screen_np)
+        while True:
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+        cv2.destroyAllWindows()
+
+    canvas.bind("<ButtonPress-1>", on_button_press)
+    canvas.bind("<B1-Motion>", on_move_press)
+    canvas.bind("<ButtonRelease-1>", on_button_release)
+    top.mainloop()
+
 live_feed_btn = ctk.CTkButton(video_pred_frame, text="Live Feed Prediction", command=lambda: threading.Thread(target=live_feed_prediction).start(), font=modern_font, width=200)
 live_feed_btn.grid(row=0, column=0, padx=5, pady=5, sticky="w")
 
 recorded_video_btn = ctk.CTkButton(video_pred_frame, text="Recorded Video Prediction", command=lambda: threading.Thread(target=recorded_video_prediction).start(), font=modern_font, width=200)
 recorded_video_btn.grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
-# A final label for any status messages
+screen_capture_btn = ctk.CTkButton(video_pred_frame, text="Screen Snip Prediction", command=lambda: threading.Thread(target=screen_capture_prediction).start(), font=modern_font, width=200)
+screen_capture_btn.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+
 predict_status_label = ctk.CTkLabel(predict_frame, text="", font=modern_font)
 predict_status_label.grid(row=3, column=0, padx=10, pady=10, sticky="w")
 
-# ---------------------------
+##########################
 # UI HELP TAB WIDGETS
-# ---------------------------
-help_frame = tabview.tab("UI Help")
+##########################
+help_frame_ui = tabview.tab("UI Help")
 
-help_frame_inner = ctk.CTkFrame(help_frame)
+help_frame_inner = ctk.CTkFrame(help_frame_ui)
 help_frame_inner.pack(padx=10, pady=10, fill="both", expand=True)
 
 help_font = ctk.CTkFont(family="Roboto", size=14)
@@ -556,30 +761,29 @@ help_textbox = ctk.CTkTextbox(help_frame_inner, font=help_font, wrap="word")
 help_textbox.pack(padx=10, pady=10, fill="both", expand=True)
 help_text = (
     "TRAIN TAB:\n"
-    "- Select the folder containing 'Good' images and the folder containing 'Bad' images.\n"
-    "- Allowed image formats - jpg, jpeg, png, bmp.\n"
+    "- Select the folder containing 'Good' images and the folder containing 'Bad' images (for two-class mode).\n"
+    "- Allowed image formats: jpg, jpeg, png, bmp.\n"
     "- Optionally, select a folder where the trained model will be saved.\n"
-    "- By default, the application auto-adjusts training parameters:\n"
-    "  If you disable auto-adjust, you can manually enter the Batch Size and Epochs.\n\n"
+    "- Use the drop-down menu to select the model architecture. For example, ResNet18 is lightweight and good for general tasks, whereas ResNet50 is deeper and may provide higher accuracy on complex datasets.\n"
+    "- By default, the application auto-adjusts training parameters. If you disable auto-adjust, you can manually enter the Batch Size and Epochs.\n\n"
     "PREDICT TAB:\n"
     "- Load a model (.pth file) and then select an image for prediction.\n"
-    "- You can also use Live Feed or Recorded Video prediction options.\n"
+    "- You can also use Live Feed, Recorded Video, or Screen Snip prediction options.\n"
     "- If the model predicts 'bad', the regions contributing to that decision will be highlighted with bounding boxes.\n\n"
     "TRAINING TERMINOLOGY:\n"
     "- Epoch: One complete pass through the training data.\n"
     "- Loss: A measure of error; lower values indicate better performance.\n"
     "- Validation Accuracy: The percentage of correctly classified images on unseen data.\n\n"
-    "This application uses transfer learning with a pre-trained ResNet18. Training runs in a separate thread so that the UI remains responsive, and a progress bar shows training completion."
+    "This application uses transfer learning with a pre-trained ResNet model. Training runs in a separate thread so that the UI remains responsive, and a progress bar shows training completion."
 )
 help_textbox.insert("0.0", help_text)
 help_textbox.configure(state="disabled")
 
-# ---------------------------
+##########################
 # MODEL HELP TAB WIDGETS
-# ---------------------------
+##########################
 help_frame_model = tabview.tab("Model Help")
 
-# Container for the detailed explanation (Larger)
 detailed_container = ctk.CTkFrame(help_frame_model)
 detailed_container.pack(padx=5, pady=5, fill="both", expand=True)
 
@@ -598,35 +802,23 @@ detailed_textbox.pack(padx=5, pady=5, fill="both", expand=True)
 detailed_text = (
     "Decision Process (Inference)\n\n"
     "Feature Extraction:\n"
-    "The model, built on a convolutional neural network (CNN) like ResNet18, processes an image "
-    "through several layers that automatically learn to recognize useful features—such as edges, "
-    "textures, and more complex patterns. These features help the model distinguish between “good” "
-    "and “bad” images.\n\n"
+    "The model, built on a convolutional neural network (CNN) like ResNet, processes an image through several layers that automatically learn to recognize useful features—such as edges, textures, and more complex patterns. These features help the model distinguish between “good” and “bad” images.\n\n"
     "Classification Head:\n"
-    "After feature extraction, the final layers (usually fully connected layers) take these learned "
-    "features and assign scores to each class. These scores are then converted into probabilities (using "
-    "a function like softmax). The class with the highest probability becomes the model's prediction.\n\n"
+    "After feature extraction, the final layers (usually fully connected layers) take these learned features and assign scores to each class. These scores are then converted into probabilities (using a function like softmax). The class with the highest probability becomes the model's prediction.\n\n"
     "What Happens During Training\n"
     "Forward Pass:\n"
-    "The training images (labeled as “good” or “bad”) are fed into the model. The model makes predictions "
-    "based on its current weights (its internal parameters).\n\n"
+    "The training images (labeled as “good” or “bad”) are fed into the model. The model makes predictions based on its current weights (its internal parameters).\n\n"
     "Loss Calculation:\n"
-    "A loss function (such as cross-entropy loss) measures the difference between the model’s predictions and "
-    "the actual labels. For example, if the model predicts 70% 'good' for an image that is actually 'good', the "
-    "loss will be relatively low. If it predicts incorrectly, the loss will be higher.\n\n"
+    "A loss function (such as cross-entropy loss) measures the difference between the model’s predictions and the actual labels. For example, if the model predicts 70% 'good' for an image that is actually 'good', the loss will be relatively low. If it predicts incorrectly, the loss will be higher.\n\n"
     "Backpropagation:\n"
-    "The model then calculates how much each weight contributed to the loss. It uses this information to adjust "
-    "(or 'update') the weights, aiming to reduce the loss in future predictions.\n\n"
+    "The model then calculates how much each weight contributed to the loss. It uses this information to adjust (or 'update') the weights, aiming to reduce the loss in future predictions.\n\n"
     "Epochs and Iteration:\n"
-    "One epoch is a complete pass through the entire training dataset. The training process repeats for many epochs "
-    "(e.g., 42 epochs), during which the model gradually improves its performance. You’ll typically see the loss "
-    "decrease and the accuracy increase over time.\n\n"
+    "One epoch is a complete pass through the entire training dataset. The training process repeats for many epochs (e.g., 42 epochs), during which the model gradually improves its performance. You’ll typically see the loss decrease and the accuracy increase over time.\n\n"
 )
 
 detailed_textbox.insert("0.0", detailed_text)
 detailed_textbox.configure(state="disabled")
 
-# Container for "In Simple Terms" (Smaller)
 simple_container = ctk.CTkFrame(help_frame_model)
 simple_container.pack(padx=5, pady=5, fill="both", expand=True)
 
@@ -634,7 +826,7 @@ simple_label = ctk.CTkLabel(simple_container, text="In Simple Terms", font=model
 simple_label.pack(anchor="w", padx=5, pady=(5, 0))
 
 simple_frame = ctk.CTkFrame(simple_container, height=300)
-simple_frame.pack(padx=5, pady=5, fill="both", expand=False)
+simple_frame.pack(padx=5, pady=5, fill="both", expand=True)
 simple_frame.pack_propagate(False)
 
 simple_textbox = ctk.CTkTextbox(simple_frame, font=modelhelp_font, wrap="word")
@@ -644,12 +836,9 @@ simple_text = (
     "Before Training:\n"
     "The model starts with random weights—it doesn’t “know” what good or bad images look like.\n\n"
     "During Training:\n"
-    "It looks at many examples of good and bad images, compares its guesses to the actual labels, and learns by "
-    "tweaking its internal settings to get better at distinguishing between the two.\n\n"
+    "It looks at many examples of good and bad images, compares its guesses to the actual labels, and learns by tweaking its internal settings to get better at distinguishing between the two.\n\n"
     "After Training:\n"
-    "The model has “learned” the patterns that define a good image versus a bad one. When you feed it a new image, "
-    "it extracts features, processes them through the layers it trained, and outputs a decision based on the patterns "
-    "it has learned."
+    "The model has “learned” the patterns that define a good image versus a bad one. When you feed it a new image, it extracts features, processes them through the layers it trained, and outputs a decision based on the patterns it has learned."
 )
 
 simple_textbox.insert("0.0", simple_text)
